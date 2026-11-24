@@ -1,7 +1,8 @@
 import { app, dialog, ipcMain, safeStorage } from 'electron'
 import { readFile } from 'node:fs/promises'
 import { basename, join } from 'node:path'
-import type { OpenRecentResult, TranslationSettings, UnderlineAnnotation } from '../shared/contracts.js'
+import type { AskPassageInput, OpenRecentResult, TranslationSettings, UnderlineAnnotation } from '../shared/contracts.js'
+import { askPassage } from './ai/client.js'
 import { Credentials } from './security/credentials.js'
 import { openedDocument, readVerifiedDocument } from './storage/document-files.js'
 import { documentId, DocumentStore } from './storage/document-store.js'
@@ -20,6 +21,20 @@ function annotationInput(value: unknown): UnderlineAnnotation {
   const annotation = value as UnderlineAnnotation
   if (typeof annotation.id !== 'string' || !annotation.id) throw new Error('Invalid underline annotation.')
   if (annotation.comment !== undefined && (typeof annotation.comment !== 'string' || annotation.comment.length > 10_000)) throw new Error('Invalid underline comment.')
+  if (annotation.conversation !== undefined) {
+    const conversation = annotation.conversation
+    if (!conversation || typeof conversation !== 'object' || !Array.isArray(conversation.messages) ||
+      conversation.messages.length > 200 || !Number.isFinite(conversation.updatedAt)) {
+      throw new Error('Invalid AI conversation.')
+    }
+    for (const message of conversation.messages) {
+      if (!message || (message.role !== 'user' && message.role !== 'assistant') ||
+        typeof message.content !== 'string' || !message.content || message.content.length > 20_000 ||
+        !Number.isFinite(message.at)) {
+        throw new Error('Invalid AI conversation message.')
+      }
+    }
+  }
   return annotation
 }
 
@@ -74,7 +89,7 @@ export function registerIpc(): void {
     catch { throw new Error('Provide a valid HTTPS endpoint, model, and API key.') }
     if ((endpoint.protocol !== 'https:' && !(endpoint.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(endpoint.hostname))) || endpoint.username || endpoint.password || !settings.model.trim()) throw new Error('Provide a valid HTTPS endpoint and model.')
     if (key.trim()) await credentials.set(key)
-    else if (!(await credentials.get())) throw new Error('An API key is required for translation.')
+    else if (!(await credentials.get())) throw new Error('An API key is required for translation and Ask AI.')
     await translationSettings.save(settings)
   })
   ipcMain.handle('translation:clear-settings', async () => {
@@ -87,5 +102,13 @@ export function registerIpc(): void {
     const key = await credentials.get()
     if (!key) throw new Error('Configure an LLM API key in Settings first.')
     return translateText(settings.endpoint, settings.model, key, text, target)
+  })
+  ipcMain.handle('ai:ask', async (_event, input: unknown) => {
+    if (!input || typeof input !== 'object' || !Array.isArray((input as AskPassageInput).history)) throw new Error('Invalid AI question.')
+    const settings = await translationSettings.get()
+    if (!settings) throw new Error('Configure an LLM endpoint, model, and API key in Settings first.')
+    const key = await credentials.get()
+    if (!key) throw new Error('Configure an LLM API key in Settings first.')
+    return askPassage(settings.endpoint, settings.model, key, input as AskPassageInput)
   })
 }

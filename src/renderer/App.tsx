@@ -2,9 +2,11 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { getDocument, GlobalWorkerOptions, type PDFDocumentProxy } from 'pdfjs-dist'
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import type { OpenedDocument, OpenRecentResult, RecentDocument, Rect, UnderlineAnnotation } from '../shared/contracts'
+import { AiPanel } from './AiPanel'
 import { AnnotationEditor } from './AnnotationEditor'
 import { layoutAnchorAt, layoutOffsetFor, layoutPages, type PageSize, type ReadingAnchor } from './continuous-layout'
 import { OutlineSidebar } from './OutlineSidebar'
+import { buildPageContext, type PageTextItem } from './page-context'
 import { PageView } from './PageView'
 import { loadOutline, type OutlineItem } from './pdf-outline'
 import { resolveDestinationPage, type LinkDestination } from './pdf-links'
@@ -17,6 +19,21 @@ GlobalWorkerOptions.workerSrc = workerUrl
 type SelectionSnapshot = { text: string; page: number | null; crossPage: boolean; rects: Rect[] }
 type OpenPayload = OpenedDocument | OpenRecentResult | null
 type RecentIssue = 'missing' | 'changed'
+type AskTarget = { annotationId: string | null; page: number; text: string; rects: Rect[] | null }
+
+const MIN_AI_WIDTH = 300
+const MAX_AI_WIDTH = 720
+const DEFAULT_AI_WIDTH = 380
+const AI_WIDTH_KEY = 'mimosa.ai-panel-width'
+
+function storedAiWidth(): number {
+  try {
+    const value = Number(localStorage.getItem(AI_WIDTH_KEY))
+    return Number.isFinite(value) && value > 0 ? Math.min(MAX_AI_WIDTH, Math.max(MIN_AI_WIDTH, value)) : DEFAULT_AI_WIDTH
+  } catch {
+    return DEFAULT_AI_WIDTH
+  }
+}
 
 export default function App() {
   const [doc, setDoc] = useState<PDFDocumentProxy | null>(null)
@@ -38,6 +55,12 @@ export default function App() {
   const [opening, setOpening] = useState(false)
   const [readerHeight, setReaderHeight] = useState(0)
   const [annotationEditor, setAnnotationEditor] = useState<{ id: string } | null>(null)
+  const [askTarget, setAskTarget] = useState<AskTarget | null>(null)
+  const [aiQuestion, setAiQuestion] = useState('')
+  const [aiBusy, setAiBusy] = useState(false)
+  const [aiError, setAiError] = useState('')
+  const [aiConfirmed, setAiConfirmed] = useState(false)
+  const [aiWidth, setAiWidth] = useState(storedAiWidth)
   const [recent, setRecent] = useState<RecentDocument[]>([])
   const [recentLoading, setRecentLoading] = useState(false)
   const [recentError, setRecentError] = useState('')
@@ -56,6 +79,11 @@ export default function App() {
   const pendingAnchorRef = useRef<ReadingAnchor | null>(null)
   const lastSavedPageRef = useRef<number | null>(null)
   const skipBlurCommitRef = useRef(false)
+  const pageTextRef = useRef<Map<number, PageTextItem[]>>(new Map())
+  const aiWidthRef = useRef(aiWidth)
+  const annotationsRef = useRef(annotations)
+  aiWidthRef.current = aiWidth
+  annotationsRef.current = annotations
 
   const layout = useMemo(() => layoutPages(sizes ?? [], scale), [sizes, scale])
 
@@ -95,6 +123,11 @@ export default function App() {
     setEditingPage(false)
     skipBlurCommitRef.current = false
     setAnnotationEditor(null)
+    setAskTarget(null)
+    setAiQuestion('')
+    setAiBusy(false)
+    setAiError('')
+    pageTextRef.current.clear()
     setDoc(null)
     setSizes(null)
     setOpened(null)
@@ -272,7 +305,9 @@ export default function App() {
 
   const saveAnnotationComment = useCallback(async (annotation: UnderlineAnnotation, comment: string | undefined) => {
     if (!opened) throw new Error('No document is open.')
-    const next: UnderlineAnnotation = { ...annotation }
+    // Merge onto the latest copy so a comment saved while an AI answer arrives
+    // cannot drop the conversation that was added meanwhile.
+    const next: UnderlineAnnotation = { ...(annotationsRef.current.find(item => item.id === annotation.id) ?? annotation) }
     if (comment === undefined) delete next.comment
     else next.comment = comment
     // Persist first; the editor only closes after this resolves.
@@ -286,8 +321,156 @@ export default function App() {
     await window.mimosa.deleteAnnotation(opened.id, id)
     setAnnotations(current => current.filter(item => item.id !== id))
     setAnnotationEditor(current => (current?.id === id ? null : current))
+    setAskTarget(current => (current?.annotationId === id ? null : current))
     setMessage('Underline removed.')
   }, [opened])
+
+  function askAboutAnnotation(id: string) {
+    const annotation = annotations.find(item => item.id === id)
+    if (!annotation) return
+    setAnnotationEditor(null)
+    setAskTarget({ annotationId: annotation.id, page: annotation.page, text: annotation.text, rects: annotation.rects })
+    setAiQuestion('')
+    setAiError('')
+    setMessage('')
+  }
+
+  function askAboutSelection() {
+    if (!opened) return
+    const live = window.getSelection()
+    if (live && !live.isCollapsed && live.toString().trim()) captureSelection()
+    const snapshot = selectionRef.current
+    if (!snapshot?.text) return
+    if (snapshot.crossPage || snapshot.page === null || snapshot.rects.length === 0) {
+      setMessage('Select text within a single page to ask AI.')
+      return
+    }
+    const existing = annotations.find(item => item.page === snapshot.page && item.text === snapshot.text)
+    if (existing) {
+      setAskTarget({ annotationId: existing.id, page: existing.page, text: existing.text, rects: existing.rects })
+    } else {
+      setAskTarget({ annotationId: null, page: snapshot.page, text: snapshot.text, rects: snapshot.rects })
+    }
+    setAiQuestion('')
+    setAiError('')
+    setMessage('')
+    selectionRef.current = null
+    window.getSelection()?.removeAllRanges()
+    setSelectedText('')
+  }
+
+  async function askPageContext(page: number, passage: string): Promise<string> {
+    if (!doc) return ''
+    let items = pageTextRef.current.get(page)
+    if (!items) {
+      const pdfPage = await doc.getPage(page)
+      const content = await pdfPage.getTextContent()
+      items = content.items.flatMap(item => 'str' in item ? [{ str: item.str, hasEOL: item.hasEOL }] : [])
+      pageTextRef.current.set(page, items)
+    }
+    return buildPageContext(items, passage)
+  }
+
+  async function sendAiQuestion() {
+    if (!opened || !askTarget || aiBusy) return
+    const question = aiQuestion.trim()
+    if (!question) return
+    if (!aiConfirmed && !window.confirm('Send this passage, its page text, your question, and the earlier messages in this conversation to your configured LLM provider?')) return
+    setAiConfirmed(true)
+    setAiBusy(true)
+    setAiError('')
+    try {
+      let annotation = askTarget.annotationId ? annotations.find(item => item.id === askTarget.annotationId) : undefined
+      if (!annotation) {
+        annotation = { id: crypto.randomUUID(), page: askTarget.page, text: askTarget.text, rects: askTarget.rects ?? [] }
+        await window.mimosa.saveAnnotation(opened.id, annotation)
+        const created = annotation
+        setAnnotations(current => current.some(item => item.id === created.id) ? current : [...current, created])
+        setAskTarget(current => current ? { ...current, annotationId: created.id } : current)
+      }
+      const existingMessages = annotation.conversation?.messages ?? []
+      const questionMessage = { role: 'user' as const, content: question, at: Date.now() }
+      const messagesWithQuestion = [...existingMessages, questionMessage]
+      const withQuestion: UnderlineAnnotation = { ...annotation, conversation: { messages: messagesWithQuestion, updatedAt: questionMessage.at } }
+      await window.mimosa.saveAnnotation(opened.id, withQuestion)
+      setAnnotations(current => current.map(item => item.id === withQuestion.id ? withQuestion : item))
+      setAiQuestion('')
+      const context = await askPageContext(askTarget.page, askTarget.text)
+      const answer = await window.mimosa.askPassage({
+        passage: askTarget.text,
+        page: askTarget.page,
+        context,
+        question,
+        history: existingMessages.slice(-20).map(({ role, content }) => ({ role, content }))
+      })
+      const answerMessage = { role: 'assistant' as const, content: answer, at: Date.now() }
+      // The underline or conversation may have been deleted while the request
+      // was in flight; never recreate either one with a late answer.
+      const latest = annotationsRef.current.find(item => item.id === withQuestion.id)
+      if (!latest?.conversation) return
+      const withAnswer: UnderlineAnnotation = { ...latest, conversation: { messages: [...messagesWithQuestion, answerMessage], updatedAt: answerMessage.at } }
+      await window.mimosa.saveAnnotation(opened.id, withAnswer)
+      setAnnotations(current => current.map(item => item.id === withAnswer.id ? withAnswer : item))
+    } catch (error) {
+      setAiError(error instanceof Error ? error.message : 'The AI request failed.')
+    } finally {
+      setAiBusy(false)
+    }
+  }
+
+  async function deleteAiConversation() {
+    if (!opened || !askTarget?.annotationId) return
+    const annotation = annotations.find(item => item.id === askTarget.annotationId)
+    if (!annotation?.conversation) return
+    const next: UnderlineAnnotation = { ...annotation }
+    delete next.conversation
+    try {
+      await window.mimosa.saveAnnotation(opened.id, next)
+      setAnnotations(current => current.map(item => item.id === next.id ? next : item))
+      setMessage('Conversation deleted.')
+    } catch {
+      setAiError('Could not delete this conversation.')
+    }
+  }
+
+  function persistAiWidth() {
+    try { localStorage.setItem(AI_WIDTH_KEY, String(aiWidthRef.current)) } catch { /* Storage can be unavailable; the width still applies for this session. */ }
+  }
+
+  function startAiResize(event: React.PointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return
+    event.preventDefault()
+    const target = event.currentTarget
+    const startX = event.clientX
+    const startWidth = aiWidthRef.current
+    const body = target.closest('.reader-body') as HTMLElement | null
+    const maxWidth = Math.max(MIN_AI_WIDTH, Math.min(MAX_AI_WIDTH, (body?.clientWidth ?? MAX_AI_WIDTH + 320) - 320))
+    const move = (moveEvent: PointerEvent) => {
+      const next = Math.round(Math.min(maxWidth, Math.max(MIN_AI_WIDTH, startWidth + startX - moveEvent.clientX)))
+      if (next === aiWidthRef.current) return
+      aiWidthRef.current = next
+      setAiWidth(next)
+    }
+    const finish = () => {
+      target.removeEventListener('pointermove', move)
+      target.removeEventListener('pointerup', finish)
+      target.removeEventListener('pointercancel', finish)
+      persistAiWidth()
+    }
+    target.setPointerCapture(event.pointerId)
+    target.addEventListener('pointermove', move)
+    target.addEventListener('pointerup', finish)
+    target.addEventListener('pointercancel', finish)
+  }
+
+  function resizeAiWidth(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+    event.preventDefault()
+    const next = Math.min(MAX_AI_WIDTH, Math.max(MIN_AI_WIDTH, aiWidthRef.current + (event.key === 'ArrowLeft' ? 20 : -20)))
+    aiWidthRef.current = next
+    setAiWidth(next)
+    persistAiWidth()
+  }
 
   function goToPage(value: number) {
     if (!doc) return
@@ -432,6 +615,7 @@ export default function App() {
   }
 
   const editingAnnotation = opened && annotationEditor ? annotations.find(item => item.id === annotationEditor.id) ?? null : null
+  const aiAnnotation = askTarget?.annotationId ? annotations.find(item => item.id === askTarget.annotationId) ?? null : null
 
   return <main className="app-shell">
     <header className="topbar">
@@ -446,12 +630,12 @@ export default function App() {
         setEditingPage(false)
         if (skipBlurCommitRef.current) { skipBlurCommitRef.current = false; setPageDraft(String(activePage)); return }
         commitPageDraft()
-      }} /><span>/ {doc.numPages}</span></label><button className="icon-button" aria-label="Next page" disabled={activePage >= doc.numPages} onClick={() => goToPage(activePage + 1)}>›</button><span className="tool-separator" /><button className="icon-button" aria-label="Zoom out" onClick={() => zoomBy(-.15)}>−</button><span className="zoom-value">{Math.round(scale * 100)}%</span><button className="icon-button" aria-label="Zoom in" onClick={() => zoomBy(.15)}>+</button><span className="tool-separator" /><input className="search-input" aria-label="Search document" placeholder="Search in document…" value={query} onChange={event => setQuery(event.target.value)} /><button className="icon-button search-clear" onClick={() => setQuery('')} aria-label="Clear search">×</button><span className="toolbar-spacer" />{selectedText && <><button className="button secondary" onClick={() => void underline()}>Underline</button><button className="button secondary" onClick={() => void translate()}>Translate</button></>}
-    </nav><div className="reader-body">{outline.length > 0 && <OutlineSidebar items={outline} activePage={activePage} onNavigate={goToPage} />}<section ref={readerRef} className="reader" data-active-page={activePage} onMouseUp={readerMouseUp}><div className="page-stack" style={{ paddingBottom: Math.max(0, readerHeight - (layout[layout.length - 1]?.height ?? 0)) }}>{layout.map(entry => <PageView key={entry.page} doc={doc} entry={entry} scale={scale} query={query} annotations={annotations} readerRef={readerRef} onEditAnnotation={openAnnotationEditor} onInternalLink={navigateToDestination} onRenderError={handleRenderError} />)}</div></section></div></> : <section className="welcome"><div className="welcome-card"><div className="welcome-icon">M</div><p className="eyebrow">A calmer way to read</p><h1>Make room for<br /><em>deep reading.</em></h1><p className="welcome-copy">Your documents, your notes, your pace.<br />Everything stays on your Mac.</p><button className="button primary large" disabled={opening} onClick={() => void openPdf()}>Open a PDF <span>→</span></button><div className="welcome-foot"><span className="status-dot" />Private by design <span className="foot-divider">·</span> No account required</div><RecentDocuments documents={recent} loading={recentLoading} error={recentError} issues={recentIssues} busy={opening} onOpen={id => void openRecentDocument(id)} onLocate={id => void locateRecentDocument(id)} onRetry={() => void refreshRecent()} /></div></section>}
+      }} /><span>/ {doc.numPages}</span></label><button className="icon-button" aria-label="Next page" disabled={activePage >= doc.numPages} onClick={() => goToPage(activePage + 1)}>›</button><span className="tool-separator" /><button className="icon-button" aria-label="Zoom out" onClick={() => zoomBy(-.15)}>−</button><span className="zoom-value">{Math.round(scale * 100)}%</span><button className="icon-button" aria-label="Zoom in" onClick={() => zoomBy(.15)}>+</button><span className="tool-separator" /><input className="search-input" aria-label="Search document" placeholder="Search in document…" value={query} onChange={event => setQuery(event.target.value)} /><button className="icon-button search-clear" onClick={() => setQuery('')} aria-label="Clear search">×</button><span className="toolbar-spacer" />{selectedText && <><button className="button secondary" onClick={askAboutSelection}>Ask AI</button><button className="button secondary" onClick={() => void underline()}>Underline</button><button className="button secondary" onClick={() => void translate()}>Translate</button></>}
+    </nav><div className="reader-body">{outline.length > 0 && <OutlineSidebar items={outline} activePage={activePage} onNavigate={goToPage} />}<section ref={readerRef} className="reader" data-active-page={activePage} onMouseUp={readerMouseUp}><div className="page-stack" style={{ paddingBottom: Math.max(0, readerHeight - (layout[layout.length - 1]?.height ?? 0)) }}>{layout.map(entry => <PageView key={entry.page} doc={doc} entry={entry} scale={scale} query={query} annotations={annotations} readerRef={readerRef} onEditAnnotation={openAnnotationEditor} onInternalLink={navigateToDestination} onRenderError={handleRenderError} />)}</div></section>{askTarget && <AiPanel page={askTarget.page} passage={askTarget.text} conversation={aiAnnotation?.conversation} question={aiQuestion} width={aiWidth} busy={aiBusy} error={aiError} onQuestionChange={setAiQuestion} onSend={() => void sendAiQuestion()} onDeleteConversation={() => void deleteAiConversation()} onClose={() => { setAskTarget(null); setAiError('') }} onResizeStart={startAiResize} onResizeKeyDown={resizeAiWidth} />}</div></> : <section className="welcome"><div className="welcome-card"><div className="welcome-icon">M</div><p className="eyebrow">A calmer way to read</p><h1>Make room for<br /><em>deep reading.</em></h1><p className="welcome-copy">Your documents, your notes, your pace.<br />Everything stays on your Mac.</p><button className="button primary large" disabled={opening} onClick={() => void openPdf()}>Open a PDF <span>→</span></button><div className="welcome-foot"><span className="status-dot" />Private by design <span className="foot-divider">·</span> No account required</div><RecentDocuments documents={recent} loading={recentLoading} error={recentError} issues={recentIssues} busy={opening} onOpen={id => void openRecentDocument(id)} onLocate={id => void locateRecentDocument(id)} onRetry={() => void refreshRecent()} /></div></section>}
     {message && <div role="status" className="toast">{message}<button onClick={() => setMessage('')} aria-label="Dismiss">×</button></div>}
     {translation && <aside className="translation-card"><div className="card-heading"><span>Translation</span><button onClick={() => setTranslation('')} aria-label="Close translation">×</button></div><p className="source-text">{selectedText}</p><p>{translation}</p></aside>}
-    {settingsOpen && <Settings onClose={() => setSettingsOpen(false)} onSaved={() => setMessage('Translation settings saved securely.')} />}
-    {editingAnnotation && <AnnotationEditor annotation={editingAnnotation} onSaveComment={comment => saveAnnotationComment(editingAnnotation, comment)} onDelete={() => deleteUnderline(editingAnnotation.id)} onClose={() => setAnnotationEditor(null)} />}
+    {settingsOpen && <Settings onClose={() => setSettingsOpen(false)} onSaved={() => setMessage('AI settings saved securely.')} />}
+    {editingAnnotation && <AnnotationEditor annotation={editingAnnotation} onSaveComment={comment => saveAnnotationComment(editingAnnotation, comment)} onDelete={() => deleteUnderline(editingAnnotation.id)} onAskAI={() => askAboutAnnotation(editingAnnotation.id)} onClose={() => setAnnotationEditor(null)} />}
     <span className="sr-only">{annotations.length} underline annotations saved</span>
   </main>
 }
@@ -465,7 +649,7 @@ function Settings({ onClose, onSaved }: { onClose: () => void; onSaved: () => vo
   useEffect(() => {
     void window.mimosa.getTranslationSettings().then(settings => {
       if (settings) { setEndpoint(settings.endpoint); setModel(settings.model); setConfigured(settings.configured) }
-    }).catch(() => setError('Could not load translation settings.'))
+    }).catch(() => setError('Could not load AI settings.'))
   }, [])
   async function save(event: React.FormEvent) {
     event.preventDefault()
@@ -473,8 +657,8 @@ function Settings({ onClose, onSaved }: { onClose: () => void; onSaved: () => vo
     catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not save settings.') }
   }
   async function clear() {
-    try { await window.mimosa.clearTranslationSettings(); setConfigured(false); setKey(''); setModel(''); setError('Translation settings removed.') }
+    try { await window.mimosa.clearTranslationSettings(); setConfigured(false); setKey(''); setModel(''); setError('AI settings removed.') }
     catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not remove settings.') }
   }
-  return <div className="modal-backdrop" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}><form className="settings-modal" onSubmit={event => void save(event)}><div className="modal-top"><div><p className="eyebrow">OPTIONAL · ENGLISH ↔ 中文</p><h2>Translation settings</h2></div><button type="button" className="close-button" onClick={onClose} aria-label="Close">×</button></div><p className="settings-note">Translation sends only the text you select to your chosen provider. Your key is stored securely on this Mac.</p><label>API endpoint<input required type="url" value={endpoint} onChange={event => setEndpoint(event.target.value)} /></label><label>Model<input required value={model} onChange={event => setModel(event.target.value)} placeholder="e.g. gpt-4o-mini" /></label><label>API key<input required={!configured} type="password" autoComplete="new-password" value={key} onChange={event => setKey(event.target.value)} placeholder={configured ? 'Saved securely — enter a new key to replace' : ''} /></label>{error && <p className="form-error">{error}</p>}<div className="modal-actions">{configured && <button type="button" className="button secondary" onClick={() => void clear()}>Remove key</button>}<button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary">Save securely</button></div></form></div>
+  return <div className="modal-backdrop" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}><form className="settings-modal" onSubmit={event => void save(event)}><div className="modal-top"><div><p className="eyebrow">OPTIONAL · TRANSLATION &amp; ASK AI</p><h2>AI settings</h2></div><button type="button" className="close-button" onClick={onClose} aria-label="Close">×</button></div><p className="settings-note">Translation sends the text you select. Ask AI also sends the page text around your passage and the saved conversation. Your key is stored securely on this Mac.</p><label>API endpoint<input required type="url" value={endpoint} onChange={event => setEndpoint(event.target.value)} /></label><label>Model<input required value={model} onChange={event => setModel(event.target.value)} placeholder="e.g. gpt-4o-mini" /></label><label>API key<input required={!configured} type="password" autoComplete="new-password" value={key} onChange={event => setKey(event.target.value)} placeholder={configured ? 'Saved securely — enter a new key to replace' : ''} /></label>{error && <p className="form-error">{error}</p>}<div className="modal-actions">{configured && <button type="button" className="button secondary" onClick={() => void clear()}>Remove key</button>}<button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary">Save securely</button></div></form></div>
 }

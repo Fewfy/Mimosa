@@ -6,7 +6,7 @@ Mimosa helps people read, annotate, translate, and return to work documents with
 
 ## Product status
 
-Mimosa is an early macOS desktop application. It currently supports local PDF reading, page navigation, document outlines, zoom, text search and selection, app-local underline annotations, last-page restoration, and optional English–Chinese translation through a user-configured OpenAI-compatible API.
+Mimosa is an early macOS desktop application. It currently supports local PDF reading, page navigation, document outlines, zoom, text search and selection, app-local underline annotations, last-page restoration, optional English–Chinese translation, and saved Ask AI conversations about underlined passages through a user-configured OpenAI-compatible API.
 
 ## Product goals
 
@@ -14,7 +14,7 @@ Mimosa is an early macOS desktop application. It currently supports local PDF re
 - **Capture useful context:** Let users mark important passages while reading.
 - **Remove language barriers:** Provide English–Chinese translation when the user supplies an LLM key.
 - **Resume quickly:** Restore each document to the position where the user last stopped reading.
-- **Protect work content:** Make external processing explicit and avoid sending document content to an LLM unless the user has configured translation.
+- **Protect work content:** Make external processing explicit and avoid sending document content to an LLM unless the user has configured translation or Ask AI.
 
 ## Core functionality
 
@@ -44,7 +44,7 @@ Current behavior:
 - Allow the user to remove an underline.
 - Preserve annotations when the document is closed and reopened.
 
-Underlines are stored locally in Mimosa and do not modify the source PDF. Double-click an underline to remove it. Free-form text boxes, drawing tools, highlights, and comments are not included.
+Underlines are stored locally in Mimosa and do not modify the source PDF. Click an underline to add a comment, ask AI about it, or remove it. Free-form text boxes, drawing tools, and highlights are not included.
 
 ### 3. English–Chinese translation with an LLM key
 
@@ -66,7 +66,22 @@ If no LLM key is configured, the translation action should explain that configur
 
 Selected text is sent only after the user confirms the first translation request. API keys are encrypted with Electron safeStorage on macOS. Text PDFs support selection-based translation; scanned PDFs require OCR, which is not currently included.
 
-### 4. Remember the last reading position
+### 4. Ask AI about a passage
+
+Users can ask the configured LLM provider questions about a passage while reading.
+
+Current behavior:
+
+1. The user selects text or opens an existing underline and chooses Ask AI.
+2. A resizable right-hand panel quotes the passage and accepts a question.
+3. The first request prompts the user to confirm external processing. The prompt explains that the passage, the same page's text around it, and the saved conversation are sent.
+4. The question and answer are saved locally with the underline and restored when the document is reopened.
+5. Asking about a temporary selection saves that selection as an underline when the first question is sent.
+6. The user can delete the conversation while keeping the underline, or delete the underline and its conversation together.
+
+Ask AI shares the endpoint, model, and API key configured for translation. It sends the passage, same-page context, the current question, and earlier messages in the conversation, but not the whole document. Requests time out after 60 seconds, and failures leave the saved question and underline in place.
+
+### 5. Remember the last reading position
 
 Mimosa remembers the last reading position separately for each PDF.
 
@@ -95,12 +110,13 @@ The app currently restores the last page for the same PDF file. Position is matc
 Work PDFs may contain confidential information. Mimosa should follow these rules:
 
 - Local reading, underline annotations, and reading-position persistence should work without a network connection.
-- Translation is the only initial feature that sends selected text to an external LLM provider.
+- Translation and Ask AI are the initial features that send text to an external LLM provider.
 - The user must provide and control the LLM key.
-- The app asks before the first translation request and sends only selected text.
-- API keys, selected text, and translated content are not written to application logs.
+- The app asks before the first translation or Ask AI request. Translation sends only the selected text; Ask AI sends the passage, the same page's text around it, the current question, and earlier messages in that conversation.
+- API keys, selected text, page context, questions, answers, and translations are not written to application logs.
+- Conversations are stored locally with their underline annotations in Mimosa's document store.
 - API endpoint and model settings are saved locally; the API key is encrypted with Electron safeStorage.
-- Translation requires network access; PDF reading, notes, and reading-position persistence do not.
+- Translation and Ask AI require network access; PDF reading, notes, and reading-position persistence do not.
 
 ## Acceptance criteria
 
@@ -111,7 +127,9 @@ The first usable version is ready for review when a user can:
 3. Configure an LLM key, select English or Chinese text, and receive a translation in the other language.
 4. Open a document, move to a different page, close it, reopen it, and return to the last page.
 5. Use reading and underline annotations without configuring an LLM key.
-6. Receive a clear failure message when translation is unavailable or the provider request fails.
+6. Ask AI about a selected passage or underline, receive an answer, reopen the document, and find the saved conversation.
+7. Delete a conversation without removing its underline, or delete both together.
+8. Receive a clear failure message when translation or Ask AI is unavailable or the provider request fails.
 
 ## Getting started
 
@@ -142,5 +160,6 @@ The macOS package is written to `release/`. Builds are currently unsigned; macOS
 - App-local annotations are visible only in Mimosa; they are not embedded in the PDF.
 - Last reading position stores the page number, not the scroll offset.
 - Search currently highlights matching text spans on the current page.
-- Translation requires an OpenAI-compatible Chat Completions endpoint and a model name; provider-specific variants may not be compatible.
+- Translation and Ask AI require an OpenAI-compatible Chat Completions endpoint and a model name; provider-specific variants may not be compatible.
+- Ask AI sends a capped amount of same-page text, not the whole document, and does not support streaming responses.
 - No OCR, cloud sync, or multi-platform support.

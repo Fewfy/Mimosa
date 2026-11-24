@@ -7,6 +7,6 @@ test('packaged app loads the reader and settings bridge', async () => {
     const window = await app.firstWindow()
     await expect(window.getByRole('button', { name: /open a pdf/i })).toBeVisible()
     await window.getByRole('button', { name: 'Settings' }).click()
-    await expect(window.getByRole('heading', { name: 'Translation settings' })).toBeVisible()
+    await expect(window.getByRole('heading', { name: 'AI settings' })).toBeVisible()
   } finally { await app.close() }
 })

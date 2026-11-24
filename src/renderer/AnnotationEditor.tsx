@@ -5,6 +5,7 @@ type AnnotationEditorProps = {
   annotation: UnderlineAnnotation
   onSaveComment: (comment: string | undefined) => Promise<void>
   onDelete: () => Promise<void>
+  onAskAI: () => void
   onClose: () => void
 }
 
@@ -13,7 +14,7 @@ type AnnotationEditorProps = {
  * owned by the parent so the persisted state changes before this UI changes;
  * failures keep the modal and the draft in place.
  */
-export function AnnotationEditor({ annotation, onSaveComment, onDelete, onClose }: AnnotationEditorProps) {
+export function AnnotationEditor({ annotation, onSaveComment, onDelete, onAskAI, onClose }: AnnotationEditorProps) {
   const [draft, setDraft] = useState(annotation.comment ?? '')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -43,6 +44,8 @@ export function AnnotationEditor({ annotation, onSaveComment, onDelete, onClose 
 
   async function removeUnderline() {
     if (busy) return
+    if ((annotation.conversation?.messages.length ?? 0) > 0 &&
+      !window.confirm('Delete this underline and its saved AI conversation?')) return
     setBusy(true)
     setError('')
     try {
@@ -103,6 +106,7 @@ export function AnnotationEditor({ annotation, onSaveComment, onDelete, onClose 
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="modal-actions annotation-actions">
         <button type="button" className="button danger annotation-delete" disabled={busy} onClick={() => void removeUnderline()}>Delete underline</button>
+        <button type="button" className="button secondary" disabled={busy} onClick={onAskAI}>Ask AI</button>
         <button type="button" className="button secondary" disabled={busy} onClick={() => void commit(undefined)}>Remove comment</button>
         <button type="button" className="button secondary" disabled={busy} onClick={onClose}>Cancel</button>
         <button type="button" className="button primary" disabled={busy} onClick={() => {

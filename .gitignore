@@ -4,4 +4,6 @@ dist-electron/
 *.tsbuildinfo
 test-results/
 playwright-report/
+release/
 .DS_Store
+.superpowers/

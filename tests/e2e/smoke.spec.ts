@@ -26,7 +26,7 @@ test('uses saved translation settings after restarting without opening Settings'
       await window.getByLabel('Model').fill('restart-test-model')
       await window.getByLabel('API key').fill('restart-test-key')
       await window.getByRole('button', { name: 'Save securely' }).click()
-      await expect(window.getByRole('status')).toContainText('Translation settings saved securely.')
+      await expect(window.getByRole('status')).toContainText('AI settings saved securely.')
     } finally { await firstApp.close() }
 
     const secondApp = await launchIsolatedApp(userData)
@@ -55,7 +55,7 @@ test('launches the Mimosa desktop shell and opens settings', async () => {
       window.on('domcontentloaded', () => console.log('renderer-url:', window.url()))
       await expect(window.getByRole('button', { name: /open a pdf/i })).toBeVisible()
       await window.getByRole('button', { name: 'Settings' }).click()
-      await expect(window.getByRole('heading', { name: 'Translation settings' })).toBeVisible()
+      await expect(window.getByRole('heading', { name: 'AI settings' })).toBeVisible()
       await expect(window.getByLabel('API key')).toHaveAttribute('type', 'password')
     } finally { await app.close() }
   } finally { await removeUserDataDirectory(userData) }
