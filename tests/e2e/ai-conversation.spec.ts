@@ -126,13 +126,28 @@ async function storedAnnotations(userData: string): Promise<StoredAnnotation[]> 
 
 test('asks AI about a selection, restores the saved conversation, and deletes only the conversation', async ({ pdf, userData }) => {
   test.setTimeout(120_000)
+  const answer = [
+    '## Passage explained',
+    'It is the effort of holding several details in mind at once.',
+    '**Important** and *useful* with `context`.',
+    '- First detail\n- Second detail',
+    '1. Read\n2. Reflect',
+    '> Keep the context in mind.',
+    '```text\n' + 'long-code-'.repeat(60) + '\n```',
+    '| Concept | Meaning |\n| --- | --- |\n| Memory | ' + 'wideTable'.repeat(40) + ' |',
+    '[Reference](https://example.com/reference)',
+    '[Unsafe](javascript:alert%281%29) [Local](file:///tmp/example) [Insecure](http://example.com)',
+    '<script>window.markdownExecuted = true</script>',
+    '<img src="invalid" onerror="window.markdownExecuted = true">',
+    '![Remote image](https://example.com/image.png)'
+  ].join('\n\n')
   let lastBody: ChatBody | null = null
   const provider = createServer(async (request, response) => {
     let body = ''
     for await (const chunk of request) body += chunk
     lastBody = JSON.parse(body) as ChatBody
     response.writeHead(200, { 'content-type': 'application/json' })
-    response.end(JSON.stringify({ choices: [{ message: { content: 'It is the effort of holding several details in mind at once.' } }] }))
+    response.end(JSON.stringify({ choices: [{ message: { content: answer } }] }))
   })
   await new Promise<void>(resolve => provider.listen(0, '127.0.0.1', resolve))
   const address = provider.address()
@@ -152,16 +167,40 @@ test('asks AI about a selection, restores the saved conversation, and deletes on
     const panel = aiPanel(first.window)
     await expect(panel).toBeVisible()
     await expect(panel.locator('.ai-quote')).toContainText('MIMOSA PAGE 2')
-    await panel.getByLabel('Question about this passage').fill('What does this passage mean?')
+    await panel.getByLabel('Question about this passage').fill('What does **this passage** mean?')
     await panel.getByRole('button', { name: 'Send' }).click()
     await expect(panel).toContainText('It is the effort of holding several details in mind at once.')
+    const assistant = panel.locator('.ai-message.assistant')
+    await expect(assistant.getByRole('heading', { name: 'Passage explained', level: 2 })).toBeVisible()
+    await expect(assistant.locator('strong')).toHaveText('Important')
+    await expect(assistant.locator('em')).toHaveText('useful')
+    await expect(assistant.locator('ul li')).toHaveCount(2)
+    await expect(assistant.locator('ol li')).toHaveCount(2)
+    await expect(assistant.locator('blockquote')).toContainText('Keep the context')
+    await expect(assistant.locator('p code')).toHaveText('context')
+    await expect(assistant.locator('pre code')).toContainText('long-code-')
+    await expect(assistant.locator('table th')).toHaveText(['Concept', 'Meaning'])
+    await expect(assistant.locator('a')).toHaveCount(1)
+    await expect(assistant.getByRole('link', { name: 'Reference' })).toHaveAttribute('href', 'https://example.com/reference')
+    await expect(assistant.locator('a')).toHaveAttribute('target', '_blank')
+    await expect(assistant.locator('a')).toHaveAttribute('rel', 'noopener noreferrer')
+    await expect(assistant.locator('script, img, iframe')).toHaveCount(0)
+    expect(await first.window.evaluate(() => 'markdownExecuted' in window)).toBe(false)
+    await expect(panel.locator('.ai-message.user p')).toHaveText('What does **this passage** mean?')
+    await expect(panel.locator('.ai-message.user strong')).toHaveCount(0)
+    await panel.getByRole('separator', { name: 'Resize AI panel' }).press('Home')
+    expect(await panel.evaluate(node => node.scrollWidth <= node.clientWidth + 1)).toBe(true)
+    expect(await panel.locator('.ai-messages').evaluate(node => node.scrollWidth <= node.clientWidth + 1)).toBe(true)
+    for (const selector of ['pre', 'table']) {
+      expect(await assistant.locator(selector).evaluate(node => node.scrollWidth > node.clientWidth)).toBe(true)
+    }
     await expect(first.window.locator('[data-page="2"] .underline-mark')).toHaveCount(1)
     await expect.poll(async () => (await storedAnnotations(userData))[0]?.conversation?.messages.length).toBe(2)
 
     expect(lastBody?.model).toBe('ai-test-model')
     expect(lastBody?.messages?.[0]?.content).toContain('<PAGE_CONTEXT page="2">')
     expect(lastBody?.messages?.[0]?.content).toContain('Shared underline phrase on every page.')
-    expect(lastBody?.messages?.at(-1)).toEqual({ role: 'user', content: 'What does this passage mean?' })
+    expect(lastBody?.messages?.at(-1)).toEqual({ role: 'user', content: 'What does **this passage** mean?' })
     await closeApp(first.app)
 
     const second = await launch(userData)
@@ -174,8 +213,10 @@ test('asks AI about a selection, restores the saved conversation, and deletes on
     await dialog.getByRole('button', { name: 'Ask AI' }).click()
 
     const restored = aiPanel(second.window)
-    await expect(restored).toContainText('What does this passage mean?')
+    await expect(restored).toContainText('What does **this passage** mean?')
     await expect(restored).toContainText('It is the effort of holding several details in mind at once.')
+    await expect(restored.getByRole('heading', { name: 'Passage explained', level: 2 })).toBeVisible()
+    await expect(restored.locator('.ai-message.assistant strong')).toHaveText('Important')
     await restored.getByRole('button', { name: 'Delete conversation' }).click()
     await expect(second.window.getByRole('status')).toContainText('Conversation deleted.')
     await expect(restored.locator('.ai-message')).toHaveCount(0)

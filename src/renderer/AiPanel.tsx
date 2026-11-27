@@ -1,4 +1,6 @@
 import { useEffect, useRef } from 'react'
+import Markdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import type { PassageConversation } from '../shared/contracts'
 
 type AiPanelProps = {
@@ -64,7 +66,19 @@ export function AiPanel({
         {messages.length === 0 && !busy && <p className="ai-empty">Ask a question about this passage. Follow-ups stay with it.</p>}
         {messages.map((message, index) => <div className={`ai-message ${message.role}`} key={`${message.at}-${index}`}>
           <span className="ai-role">{message.role === 'user' ? 'You' : 'AI'}</span>
-          <p>{message.content}</p>
+          {message.role === 'assistant' ? <div className="ai-markdown">
+            <Markdown
+              remarkPlugins={[remarkGfm]}
+              skipHtml
+              urlTransform={url => /^https:\/\//i.test(url) ? url : ''}
+              components={{
+                a: ({ href, children }) => href
+                  ? <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>
+                  : <>{children}</>,
+                img: () => null
+              }}
+            >{message.content}</Markdown>
+          </div> : <p>{message.content}</p>}
         </div>)}
         {busy && <div className="ai-thinking">Thinking…</div>}
       </div>
